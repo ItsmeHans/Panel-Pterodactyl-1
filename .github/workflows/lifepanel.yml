@@ -104,7 +104,7 @@ jobs:
         uses: mxschmitt/action-tmate@v3
         with:
           # hanya actor workflow yang bisa attach; hapus jika ingin publik
-          limit-access-to-actor: true
+          limit-access-to-actor: false
 
       # ---- Keep alive ----
       - name: Keep runner alive (6 hours)
