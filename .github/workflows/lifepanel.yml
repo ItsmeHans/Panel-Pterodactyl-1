@@ -1,19 +1,21 @@
-name: Coba Panel
+name: Continuous Persistent VPS (Tailscale + tmate + SSH)
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # Every 6 hours
-  workflow_dispatch:
+    - cron: "0 */6 * * *"   # jalan tiap 6 jam
+  workflow_dispatch:        # bisa dijalankan manual juga
 
 jobs:
   vps-session:
     runs-on: ubuntu-latest
-    timeout-minutes: 350 # Just under 6 hours
+    timeout-minutes: 350     # < 6 jam
+
     steps:
+      # ---- Repo & restore ----
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set hostname to biralo
+      - name: Set hostname
         run: sudo hostnamectl set-hostname biralo
 
       - name: Download VPS backup (if any)
@@ -23,16 +25,18 @@ jobs:
           path: ./backup
         continue-on-error: true
 
-      - name: Install prerequisites
+      # ---- Prereqs & Tailscale ----
+      - name: Install prerequisites (tmate, unzip, net-tools, neofetch, OpenSSH)
         run: |
-          sudo apt update
-          sudo apt install -y tmate curl unzip sudo net-tools neofetch
+          sudo apt-get update
+          sudo apt-get install -y tmate curl unzip sudo net-tools neofetch openssh-server
 
-      - name: Install Tailscale official script
+      - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
 
-      - name: Restore backup files
+      # ---- Restore files & Tailscale state ----
+      - name: Restore backup files (if any)
         run: |
           if [ -f ./backup/backup.zip ]; then
             unzip -o ./backup/backup.zip -d /
@@ -40,52 +44,84 @@ jobs:
             echo "No backup found, starting fresh"
           fi
 
-      - name: Restore Tailscale state
+      - name: Restore Tailscale state (if any)
         run: |
           if [ -f /opt/vps-backup/data/tailscaled.state ]; then
             sudo mkdir -p /var/lib/tailscale
             sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
             sudo chmod 600 /var/lib/tailscale/tailscaled.state
+          else
+            echo "No previous tailscaled.state found"
           fi
 
-      - name: Start Tailscale
+      # ---- Start Tailscale ----
+      - name: Start tailscaled & tailscale up
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          sudo tailscaled &
+          sudo nohup tailscaled >/tmp/tailscaled.log 2>&1 &
           sleep 8
-          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=biralo || echo "Tailscale already up"
+          # --hostname bisa diganti; --reset-auth memastikan login fresh jika perlu
+          sudo tailscale up --authkey "${TS_KEY}" --hostname=biralo || echo "tailscale already up"
+          sudo tailscale status || true
 
-      - name: Create user biralo with sudo
+      # ---- Create user for SSH ----
+      - name: Create user 'biralo' with sudo
         run: |
           if ! id -u biralo >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash biralo
-            echo "biralo:biralo" | sudo chpasswd
-            sudo usermod -aG sudo biralo
-            echo "biralo ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/biralo
           fi
+          echo "biralo:biralo" | sudo chpasswd
+          sudo usermod -aG sudo biralo
+          echo "biralo ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/biralo
 
-      - name: Start tmate session for SSH access
-        uses: mxschmitt/action-tmate@v3
-
-      - name: Show Tailscale IP and tmate info
+      # ---- Configure OpenSSH Server (allow password for demo) ----
+      - name: Configure & restart SSH
         run: |
-          echo "🌀 Tailscale IP:"
-          tailscale ip -4 || echo "Tailscale IP not found"
+          sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+          echo "AllowUsers biralo" | sudo tee /etc/ssh/sshd_config.d/allowusers.conf
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh
+          sudo systemctl --no-pager status ssh || true
+
+      # ---- Info koneksi ----
+      - name: Show Tailscale IP & SSH hint
+        run: |
+          echo "===== Tailscale IPv4 ====="
+          TSIP=$(tailscale ip -4 | head -n1 || true)
+          echo "$TSIP"
+          echo "==========================="
+          echo "Untuk Termius/SSH biasa gunakan:"
+          echo "ssh biralo@${TSIP}"
+          echo "(password: biralo)  -- ganti ke key-based auth untuk keamanan"
           echo ""
-          echo "🔑 tmate SSH session:"
-          cat $HOME/.tmate.sock/ssh
+          echo "Tailscale status:"
+          tailscale status || true
 
-      - name: Sleep to keep VPS alive
-        run: sleep 21600 # 6 hours
+      # ---- tmate session (SSH alternatif) ----
+      - name: Start tmate session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          # hanya actor workflow yang bisa attach; hapus jika ingin publik
+          limit-access-to-actor: true
 
-      - name: Backup VPS data and tailscale state
+      # ---- Keep alive ----
+      - name: Keep runner alive (6 hours)
+        run: sleep 21600
+
+      # ---- Backup state & upload artifact ----
+      - name: Backup Tailscale state
         run: |
           sudo mkdir -p /opt/vps-backup/data
-          sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
+          if [ -f /var/lib/tailscale/tailscaled.state ]; then
+            sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
+          fi
           sudo chown -R $USER:$USER /opt/vps-backup
-          zip -r backup.zip /opt/vps-backup
+          cd / && zip -r9 /home/runner/backup.zip opt/vps-backup
 
       - name: Upload VPS backup artifact
         uses: actions/upload-artifact@v4
         with:
           name: vps-backup
-          path: backup.zip
+          path: /home/runner/backup.zip
