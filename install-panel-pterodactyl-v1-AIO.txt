@@ -187,5 +187,4 @@ $DC ps
 
 echo
 echo "✅ Wings start. Jika Node belum 'Connected':"
-echo "   1) Pastikan config/config.yml sudah benar (uuid/token/remote)."
-echo "   2) Restart Wings:  $DC up -d && $DC logs -f wings"
+echo "   1 Langkah lagi yaitu copy paste Configuration File Node Panel ke config.yml."
