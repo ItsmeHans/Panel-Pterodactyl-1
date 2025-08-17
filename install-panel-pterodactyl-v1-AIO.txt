@@ -137,7 +137,7 @@ mkdir -p pterodactyl/wings
 cd pterodactyl/wings
 
 # compose untuk wings
-cat > docker-compose.yml <<'YML'
+cat <<EOF > docker-compose.yml
 services:
   wings:
     image: __WINGS_IMAGE__
@@ -173,7 +173,7 @@ networks:
         - subnet: 172.21.0.0/16
     driver_opts:
       com.docker.network.bridge.name: wings0
-YML
+EOF
 
 # ganti placeholder image & timezone
 sed -i "s#__WINGS_IMAGE__#${WINGS_IMAGE}#g" docker-compose.yml
