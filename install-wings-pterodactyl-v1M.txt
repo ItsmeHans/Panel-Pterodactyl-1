@@ -29,6 +29,7 @@ services:
     ports:
       - "8080:8080"   # API/HTTP Wings
       - "2022:2022"   # SFTP
+      - "443:443"
     tty: true
     environment:
       TZ: Asia/Jakarta
