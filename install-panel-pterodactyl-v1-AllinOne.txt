@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# all-in-one-pterodactyl.sh — install Pterodactyl Panel + Wings (fast & latest)
+set -euo pipefail
+
+### === PARAMETER CEPAT (ubah sesuai kebutuhan) ================================
+: "${APP_URL:=http://localhost}"         # domain Panel kamu (wajib benar untuk login & API)
+: "${TZ:=Asia/Jakarta}"                  # timezone
+: "${PANEL_HTTP_PORT:=80}"               # port HTTP Panel di host
+: "${PANEL_IMAGE:=ghcr.io/pterodactyl/panel:latest}"
+: "${WINGS_IMAGE:=ghcr.io/pterodactyl/wings:latest}"
+### ===========================================================================
+
+# --- helper: pilih perintah compose ---
+if docker compose version >/dev/null 2>&1; then
+  DC="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+  DC="docker-compose"
+else
+  echo "❌ Docker Compose tidak ditemukan. Instal Docker terlebih dulu."
+  exit 1
+fi
+
+# --- helper: pembangkit password random ---
+rand() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20
+  else
+    tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20
+  fi
+}
+
+DB_USER_PASS="${DB_USER_PASS:-$(rand)}"
+DB_ROOT_PASS="${DB_ROOT_PASS:-$(rand)}"
+
+echo "🔧 Using:"
+echo "  APP_URL         : ${APP_URL}"
+echo "  TZ              : ${TZ}"
+echo "  PANEL_HTTP_PORT : ${PANEL_HTTP_PORT}"
+echo "  PANEL_IMAGE     : ${PANEL_IMAGE}"
+echo "  WINGS_IMAGE     : ${WINGS_IMAGE}"
+echo
+
+### === PANEL =================================================================
+echo "📦 Installing Pterodactyl Panel…"
+mkdir -p pterodactyl/panel
+cd pterodactyl/panel
+
+# tulis docker-compose.yml (tanpa key 'version' agar no-warning)
+cat > docker-compose.yml <<YML
+services:
+  database:
+    image: mariadb:10.11
+    restart: always
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_DATABASE: panel
+      MYSQL_USER: pterodactyl
+      MYSQL_PASSWORD: ${DB_USER_PASS}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASS}
+      TZ: ${TZ}
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${DB_ROOT_PASS}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  panel:
+    image: ${PANEL_IMAGE}
+    restart: always
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${PANEL_HTTP_PORT}:80"
+    environment:
+      TZ: ${TZ}
+      APP_ENV: production
+      APP_ENVIRONMENT_ONLY: false
+      APP_URL: ${APP_URL}
+      APP_TIMEZONE: ${TZ}
+      TRUSTED_PROXIES: "*"
+
+      DB_HOST: database
+      DB_PORT: 3306
+      DB_DATABASE: panel
+      DB_USERNAME: pterodactyl
+      DB_PASSWORD: ${DB_USER_PASS}
+
+      CACHE_DRIVER: redis
+      QUEUE_CONNECTION: redis
+      SESSION_DRIVER: redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      MAIL_MAILER: log
+      MAIL_FROM: "noreply@example.com"
+    volumes:
+      - ./data/var:/app/var
+      - ./data/logs:/app/storage/logs
+YML
+
+$DC up -d
+
+echo "⏳ Init Panel (key, migrate)…"
+$DC exec panel php artisan key:generate --force
+$DC exec panel php artisan migrate --force || true
+
+echo "👤 Buat admin (interaktif, lanjutkan di prompt)…"
+$DC exec panel php artisan p:user:make || true
+
+echo "✅ Panel up. URL: ${APP_URL}"
+echo "   DB user pass : ${DB_USER_PASS}"
+echo "   DB root pass : ${DB_ROOT_PASS}"
+echo
+
+### === WINGS =================================================================
+echo "🪽 Installing Pterodactyl Wings…"
+cd ..
+mkdir -p pterodactyl/wings
+cd pterodactyl/wings
+
+# compose untuk wings
+cat > docker-compose.yml <<'YML'
+services:
+  wings:
+    image: __WINGS_IMAGE__
+    container_name: wings
+    restart: always
+    networks:
+      - wings0
+    ports:
+      - "8080:8080"   # API/HTTP Wings
+      - "2022:2022"   # SFTP
+      - "443:443"   # SFTP
+    tty: true
+    environment:
+      TZ: "__TZ__"
+      WINGS_UID: 988
+      WINGS_GID: 988
+      WINGS_USERNAME: pterodactyl
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/containers/:/var/lib/docker/containers/
+      - /etc/pterodactyl/:/etc/pterodactyl/
+      - /var/lib/pterodactyl/:/var/lib/pterodactyl/
+      - /var/log/pterodactyl/:/var/log/pterodactyl/
+      - /tmp/pterodactyl/:/tmp/pterodactyl/
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+
+networks:
+  wings0:
+    name: wings0
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
+    driver_opts:
+      com.docker.network.bridge.name: wings0
+YML
+
+# ganti placeholder image & timezone
+sed -i "s#__WINGS_IMAGE__#${WINGS_IMAGE}#g" docker-compose.yml
+sed -i "s#__TZ__#${TZ}#g" docker-compose.yml
+
+
+echo "🚀 Menjalankan Wings…"
+$DC up -d
+sleep 2
+$DC ps
+
+echo
+echo "✅ Wings start. Jika Node belum 'Connected':"
+echo "   1) Pastikan config/config.yml sudah benar (uuid/token/remote)."
+echo "   2) Restart Wings:  $DC up -d && $DC logs -f wings"
