@@ -1,0 +1,23 @@
+name: Ephemeral Shell via tmate (simple)
+
+on:
+  workflow_dispatch:   # jalankan manual saja biar nggak spam runner
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Print runner info (optional)
+        run: |
+          uname -a
+          echo "Home: $HOME"
+          whoami
+
+      # ⬇️ Step utama: ini akan MENCETAK kredensial tmate di log.
+      #   Cari baris:  "SSH connection: ssh <token>@<region>.tmate.io"
+      - name: Start tmate session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: false   # biar Anda bisa connect dari akun mana pun
