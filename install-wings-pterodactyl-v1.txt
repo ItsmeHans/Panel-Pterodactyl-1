@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+
+echo "🪽 Installing Pterodactyl Wings (Docker Compose)"
+
+# Pilih perintah compose
+if docker compose version >/dev/null 2>&1; then
+  DC="docker compose"
+else
+  DC="docker-compose"
+fi
+
+mkdir -p pterodactyl/wings
+cd pterodactyl/wings
+
+cat > docker-compose.yml <<'YML'
+version: "3.8"
+
+services:
+  wings:
+    image: ghcr.io/pterodactyl/wings:latest
+    container_name: wings
+    restart: always
+    networks:
+      - wings0
+    ports:
+      - "8080:8080"   # API/HTTP untuk Wings
+      - "2022:2022"   # SFTP internal untuk server
+      # ⚠️ JANGAN expose 443 di sini agar tidak konflik dengan Panel / reverse proxy
+    tty: true
+    environment:
+      TZ: Asia/Jakarta
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/containers/:/var/lib/docker/containers/
+      - /etc/pterodactyl/:/etc/pterodactyl/
+      - /var/lib/pterodactyl/:/var/lib/pterodactyl/
+      - /var/log/pterodactyl/:/var/log/pterodactyl/
+      - /tmp/pterodactyl/:/tmp/pterodactyl/
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+      # Jika pakai Let's Encrypt di host, bisa tambahkan:
+      # - /etc/letsencrypt/:/etc/letsencrypt/
+
+networks:
+  wings0:
+    name: wings0
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
+    driver_opts:
+      com.docker.network.bridge.name: wings0
+YML
+
+$DC up -d
+
+echo "⚙️  Menjalankan konfigurasi interaktif Wings (akan meminta Token & URL Node)..."
+echo "👉 Siapkan: Panel > Nodes > Create/Configure Node > Generate Config"
+echo "   Lalu tempelkan data saat diminta oleh 'wings configure'."
+
+# Ini interaktif—menulis /etc/pterodactyl/config.yml (di-host via volume)
+$DC run --rm wings wings configure || true
+
+# Setelah config.yml dibuat, jalankan ulang
+$DC up -d
+
+echo "✅ Wings siap. Pastikan Node di Panel berstatus connected."
