@@ -1,22 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ====== Konfigurasi awal ======
+PANEL_URL="${PANEL_URL:-}"
+TOKEN="${TOKEN:-}"
+MODE="auto"   # "auto" (Auto-Deploy) atau "manual"
 
-echo "🪽 Installing Pterodactyl Wings (Docker Compose)"
+# Parse argumen sederhana
+for arg in "$@"; do
+  case "$arg" in
+    --manual) MODE="manual" ;;
+    --panel-url=*) PANEL_URL="${arg#*=}" ;;
+    --token=*) TOKEN="${arg#*=}" ;;
+  esac
+done
 
-# Pilih perintah compose
+# Pilih perintah compose (v2: 'docker compose', fallback: 'docker-compose')
 if docker compose version >/dev/null 2>&1; then
   DC="docker compose"
 else
   DC="docker-compose"
 fi
 
-mkdir -p pterodactyl/wings
+echo "🪽 Installing Pterodactyl Wings (mode: $MODE)"
+
+# ====== Buat direktori kerja ======
+mkdir -p pterodactyl/wings/config
 cd pterodactyl/wings
 
+# ====== Tulis docker-compose.yml (tanpa field 'version' agar bebas warning) ======
 cat > docker-compose.yml <<'YML'
-version: "3.8"
-
 services:
   wings:
     image: ghcr.io/pterodactyl/wings:latest
@@ -25,22 +38,19 @@ services:
     networks:
       - wings0
     ports:
-      - "8080:8080"   # API/HTTP untuk Wings
-      - "2022:2022"   # SFTP internal untuk server
-      # ⚠️ JANGAN expose 443 di sini agar tidak konflik dengan Panel / reverse proxy
+      - "8080:8080"   # API/HTTP Wings
+      - "2022:2022"   # SFTP
     tty: true
     environment:
       TZ: Asia/Jakarta
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /var/lib/docker/containers/:/var/lib/docker/containers/
-      - /etc/pterodactyl/:/etc/pterodactyl/
+      - ./config:/etc/pterodactyl/
       - /var/lib/pterodactyl/:/var/lib/pterodactyl/
       - /var/log/pterodactyl/:/var/log/pterodactyl/
       - /tmp/pterodactyl/:/tmp/pterodactyl/
       - /etc/ssl/certs:/etc/ssl/certs:ro
-      # Jika pakai Let's Encrypt di host, bisa tambahkan:
-      # - /etc/letsencrypt/:/etc/letsencrypt/
 
 networks:
   wings0:
@@ -53,16 +63,50 @@ networks:
       com.docker.network.bridge.name: wings0
 YML
 
+# ====== Jalankan sesuai mode ======
+if [[ "$MODE" == "manual" ]]; then
+  echo "📄 MODE MANUAL: Siapkan config/config.yml dari Panel → Nodes → Configuration (copy seluruh YAML)."
+  if command -v nano >/dev/null 2>&1; then
+    echo "✏️  Membuka nano untuk edit: config/config.yml"
+    touch config/config.yml
+    nano config/config.yml
+  else
+    cat <<'MSG'
+⚠️  Editor 'nano' tidak ditemukan.
+Silakan buat file 'pterodactyl/wings/config/config.yml' berisi YAML konfigurasi node dari Panel.
+Contoh:
+  cd pterodactyl/wings
+  vi config/config.yml
+  # (paste seluruh isi YAML dari Panel di sini, simpan)
+
+MSG
+  fi
+
+  echo "🚀 Starting Wings..."
+  $DC up -d
+  echo "✅ Selesai (manual). Pastikan Node di Panel berstatus 'connected'."
+  exit 0
+fi
+
+# ====== MODE AUTO (Auto-Deploy token) ======
+# Minta input jika belum diset via env/arg
+if [[ -z "${PANEL_URL}" ]]; then
+  read -rp "? Panel URL: " PANEL_URL
+fi
+if [[ -z "${TOKEN}" ]]; then
+  read -rp "? Auto-Deploy Token: " TOKEN
+fi
+
+# Start container (agar image & mount siap), lalu jalankan konfigurasi
 $DC up -d
 
-echo "⚙️  Menjalankan konfigurasi interaktif Wings (akan meminta Token & URL Node)..."
-echo "👉 Siapkan: Panel > Nodes > Create/Configure Node > Generate Config"
-echo "   Lalu tempelkan data saat diminta oleh 'wings configure'."
+echo "⚙️  Menulis /etc/pterodactyl/config.yml via 'wings configure'..."
+# Gunakan service + volume yang sama, supaya file tersimpan ke ./config
+$DC run --rm wings wings configure \
+  --panel-url "${PANEL_URL}" \
+  --token "${TOKEN}"
 
-# Ini interaktif—menulis /etc/pterodactyl/config.yml (di-host via volume)
-$DC run --rm wings wings configure || true
-
-# Setelah config.yml dibuat, jalankan ulang
+echo "🔁 Restart Wings dengan config baru..."
 $DC up -d
 
-echo "✅ Wings siap. Pastikan Node di Panel berstatus connected."
+echo "✅ Selesai (auto-deploy). Cek status Node di Panel."
