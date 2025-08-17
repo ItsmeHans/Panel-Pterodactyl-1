@@ -1,71 +1,77 @@
 name: Continuous Persistent VPS (Tailscale + tmate + SSH)
 
 on:
-  schedule:
-    - cron: "0 */6 * * *"   # jalan tiap 6 jam
-  workflow_dispatch:        # bisa dijalankan manual juga
+  # aktifkan salah satu saja. Saat testing, lebih aman manual
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "0 */6 * * *"   # jalan tiap 6 jam
 
 jobs:
   vps-session:
     runs-on: ubuntu-latest
-    timeout-minutes: 350     # < 6 jam
+    timeout-minutes: 350
 
     steps:
-      # ---- Repo & restore ----
+      # --- Repo ---
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set hostname
-        run: sudo hostnamectl set-hostname biralo
+      - name: Set hostname (dinamis)
+        id: host
+        run: |
+          HN="biralo-${GITHUB_RUN_NUMBER}"
+          echo "HN=$HN" >> $GITHUB_OUTPUT
+          sudo hostnamectl set-hostname "$HN"
 
+      # --- Download backup ZIP kalau ada (tanpa warning/error jika kosong) ---
       - name: Download VPS backup (if any)
         uses: actions/download-artifact@v4
         with:
-          name: vps-backup
+          # ambil semua artifact backup yang cocok pola ini
+          pattern: vps-backup-*
           path: ./backup
-        continue-on-error: true
+          merge-multiple: true
+          if-no-artifact-found: ignore
 
-      # ---- Prereqs & Tailscale ----
+      # --- Prereqs & Tailscale ---
       - name: Install prerequisites (tmate, unzip, net-tools, neofetch, OpenSSH)
         run: |
           sudo apt-get update
           sudo apt-get install -y tmate curl unzip sudo net-tools neofetch openssh-server
 
       - name: Install Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
+        run: curl -fsSL https://tailscale.com/install.sh | sh
 
-      # ---- Restore files & Tailscale state ----
+      # --- Restore files & Tailscale state ---
       - name: Restore backup files (if any)
         run: |
-          if [ -f ./backup/backup.zip ]; then
-            unzip -o ./backup/backup.zip -d /
+          # Cari ZIP terbaru (kalau ada)
+          LATEST_ZIP=$(ls -1t ./backup/*.zip 2>/dev/null | head -n1 || true)
+          if [ -n "$LATEST_ZIP" ]; then
+            echo "Found backup: $LATEST_ZIP"
+            sudo unzip -o "$LATEST_ZIP" -d /
           else
             echo "No backup found, starting fresh"
           fi
 
-      - name: Restore Tailscale state (if any)
-        run: |
+          # Pulihkan tailscaled.state jika tersalin oleh ZIP
           if [ -f /opt/vps-backup/data/tailscaled.state ]; then
             sudo mkdir -p /var/lib/tailscale
             sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
             sudo chmod 600 /var/lib/tailscale/tailscaled.state
-          else
-            echo "No previous tailscaled.state found"
           fi
 
-      # ---- Start Tailscale ----
+      # --- Start Tailscale ---
       - name: Start tailscaled & tailscale up
         env:
           TS_KEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           sudo nohup tailscaled >/tmp/tailscaled.log 2>&1 &
           sleep 8
-          # --hostname bisa diganti; --reset-auth memastikan login fresh jika perlu
-          sudo tailscale up --authkey "${TS_KEY}" --hostname=biralo || echo "tailscale already up"
+          sudo tailscale up --authkey "${TS_KEY}" --hostname="${{ steps.host.outputs.HN }}" || echo "tailscale already up"
           sudo tailscale status || true
 
-      # ---- Create user for SSH ----
+      # --- User SSH ---
       - name: Create user 'biralo' with sudo
         run: |
           if ! id -u biralo >/dev/null 2>&1; then
@@ -75,42 +81,48 @@ jobs:
           sudo usermod -aG sudo biralo
           echo "biralo ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/biralo
 
-      # ---- Configure OpenSSH Server (allow password for demo) ----
-      - name: Configure & restart SSH
+      # --- Konfigurasi SSH + start sshd TANPA systemd ---
+      - name: Configure SSH and launch sshd (no systemd)
         run: |
           sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
           echo "AllowUsers biralo" | sudo tee /etc/ssh/sshd_config.d/allowusers.conf
-          sudo systemctl enable ssh
-          sudo systemctl restart ssh
-          sudo systemctl --no-pager status ssh || true
+          # jalankan sshd manual agar pasti listen di :22
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd -D -e >/tmp/sshd.log 2>&1 &
+          sleep 2
+          # verifikasi
+          (command -v ss || command -v netstat) >/dev/null || sudo apt-get install -y net-tools
+          netstat -tlnp | grep ':22' || true
+          ps aux | grep '[s]shd' || true
 
-      # ---- Info koneksi ----
+      # --- Info koneksi ---
       - name: Show Tailscale IP & SSH hint
         run: |
           echo "===== Tailscale IPv4 ====="
           TSIP=$(tailscale ip -4 | head -n1 || true)
           echo "$TSIP"
           echo "==========================="
-          echo "Untuk Termius/SSH biasa gunakan:"
-          echo "ssh biralo@${TSIP}"
-          echo "(password: biralo)  -- ganti ke key-based auth untuk keamanan"
+          echo "SSH biasa:"
+          echo "  ssh biralo@${TSIP}"
+          echo "  (password: biralo)  -- gunakan key-based untuk keamanan"
           echo ""
           echo "Tailscale status:"
           tailscale status || true
+          echo ""
+          echo "tmate akan mencetak kredensial SSH di step berikutnya."
 
-      # ---- tmate session (SSH alternatif) ----
+      # --- tmate session (SSH alternatif yang paling gampang) ---
       - name: Start tmate session
         uses: mxschmitt/action-tmate@v3
         with:
-          # hanya actor workflow yang bisa attach; hapus jika ingin publik
-          limit-access-to-actor: false
+          limit-access-to-actor: false   # biar bisa diakses dari akun Anda mana pun
 
-      # ---- Keep alive ----
+      # --- Keep alive ---
       - name: Keep runner alive (6 hours)
         run: sleep 21600
 
-      # ---- Backup state & upload artifact ----
+      # --- Backup state & upload artifact ---
       - name: Backup Tailscale state
         run: |
           sudo mkdir -p /opt/vps-backup/data
@@ -120,8 +132,8 @@ jobs:
           sudo chown -R $USER:$USER /opt/vps-backup
           cd / && zip -r9 /home/runner/backup.zip opt/vps-backup
 
-      - name: Upload VPS backup artifact
+      - name: Upload VPS backup artifact (unique name)
         uses: actions/upload-artifact@v4
         with:
-          name: vps-backup
+          name: vps-backup-${{ github.run_number }}
           path: /home/runner/backup.zip
