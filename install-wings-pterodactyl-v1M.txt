@@ -14,7 +14,7 @@ fi
 echo "🪽 Pterodactyl Wings - MODE MANUAL"
 
 # Buat struktur direktori
-mkdir -p pterodactyl/wings/config
+mkdir -p pterodactyl/wings
 cd pterodactyl/wings
 
 # Tulis docker-compose.yml (tanpa key 'version' biar tidak ada warning)
@@ -35,7 +35,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /var/lib/docker/containers/:/var/lib/docker/containers/
-      - ./config:/etc/pterodactyl/
+      - /etc/pterodactyl/:/etc/pterodactyl/
       - /var/lib/pterodactyl/:/var/lib/pterodactyl/
       - /var/log/pterodactyl/:/var/log/pterodactyl/
       - /tmp/pterodactyl/:/tmp/pterodactyl/
@@ -53,31 +53,7 @@ networks:
 YML
 
 # Pastikan file config ada, kalau belum -> buka editor untuk paste YAML dari Panel
-CONF="config/config.yml"
-if [[ ! -s "$CONF" ]]; then
-  echo
-  echo "📄 Sekarang paste **SELURUH YAML Node** dari Panel → Admin → Nodes → (pilih node) → Configuration → Show/Generate Configuration."
-  echo "   File tujuan: $(pwd)/$CONF"
-  mkdir -p config
-  touch "$CONF"
-
-  if command -v nano >/dev/null 2>&1; then
-    echo "✏️  Membuka nano… (paste YAML, lalu Ctrl+O Enter, Ctrl+X)"
-    nano "$CONF"
-  elif command -v vim >/dev/null 2>&1; then
-    echo "✏️  Membuka vim… (paste, :wq untuk simpan)"
-    vim "$CONF"
-  elif command -v vi >/dev/null 2>&1; then
-    echo "✏️  Membuka vi… (paste, :wq untuk simpan)"
-    vi "$CONF"
-  else
-    echo "⌨️  Tidak ada editor (nano/vim/vi). Gunakan metode paste manual:"
-    echo "    Jalankan perintah ini di terminal lain:"
-    echo "      cat > $(pwd)/$CONF"
-    echo "    lalu paste YAML dan tekan Ctrl+D untuk simpan."
-    read -rp "Tekan Enter setelah file $CONF sudah terisi..."
-  fi
-fi
+CONF="config.yml"
 
 # Validasi sederhana: file tidak kosong
 if [[ ! -s "$CONF" ]]; then
@@ -89,5 +65,4 @@ echo "🚀 Menjalankan Wings..."
 $DC up -d
 
 echo
-echo "✅ Selesai. Cek di Panel → Nodes apakah status Node sudah 'connected'."
-echo "   Jika belum, periksa kembali FQDN, ports, dan SSL di YAML config."
+echo "✅ Wings Sudah Selesai. 1 Langkah lagi yaitu copy paste Configuration File Node Panel ke config.yml."
