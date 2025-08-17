@@ -17,7 +17,6 @@ cd pterodactyl/panel
 
 # Buat docker-compose.yml
 cat > docker-compose.yml <<'YML'
-version: "3.8"
 
 services:
   database:
