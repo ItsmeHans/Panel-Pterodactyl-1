@@ -53,14 +53,6 @@ networks:
       com.docker.network.bridge.name: wings0
 YML
 
-# Pastikan file config ada, kalau belum -> buka editor untuk paste YAML dari Panel
-CONF="config.yml"
-
-# Validasi sederhana: file tidak kosong
-if [[ ! -s "$CONF" ]]; then
-  echo "❌ $CONF masih kosong. Pastikan kamu sudah paste YAML Node."
-  exit 1
-fi
 
 echo "🚀 Menjalankan Wings..."
 $DC up -d
