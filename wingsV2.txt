@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# install-wings-443.sh — Install Pterodactyl Wings (node-only) with port 443 exposed
+set -euo pipefail
+
+# ========= Konfigurasi Cepat (bisa override via ENV atau argumen) ============
+: "${TZ:=Asia/Jakarta}"
+: "${WINGS_IMAGE:=ghcr.io/pterodactyl/wings:latest}"   # gunakan :v1.6.x jika mau pin
+: "${REQUIRE_443:=true}"                               # wajib 443 di-host
+# Kandidat subnet untuk network 'pterodactyl0' (ambil yang tidak overlap)
+CANDIDATE_SUBNETS=("10.15.0.0/16" "10.200.0.0/16" "172.31.0.0/16" "10.77.0.0/16")
+
+# Opsi CLI:
+PANEL_URL="${PANEL_URL:-}"
+TOKEN="${TOKEN:-}"
+MODE="auto"   # auto (pakai --panel-url & --token) atau manual
+
+for arg in "$@"; do
+  case "$arg" in
+    --panel-url=*) PANEL_URL="${arg#*=}";;
+    --token=*) TOKEN="${arg#*=}";;
+    --manual) MODE="manual";;
+  esac
+done
+# ============================================================================
+
+# ---- Cek docker & compose ----
+if ! command -v docker >/dev/null 2>&1; then
+  echo "❌ Docker tidak ditemukan. Instal Docker terlebih dahulu." >&2; exit 1
+fi
+if docker compose version >/dev/null 2>&1; then
+  DC="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+  DC="docker-compose"
+else
+  echo "❌ Docker Compose tidak ditemukan. Instal docker compose terlebih dahulu." >&2; exit 1
+fi
+
+# ---- Cek port 443 (wajib kosong) ----
+if [[ "${REQUIRE_443}" == "true" ]]; then
+  if ss -lntp 2>/dev/null | grep -qE 'LISTEN.+:443\s'; then
+    echo "❌ Port 443 di host sudah dipakai proses lain. Hentikan/ubah layanan yang memakai 443 lalu jalankan ulang." >&2
+    exit 1
+  fi
+fi
+
+echo "🪽 Install Wings | TZ=${TZ} | IMAGE=${WINGS_IMAGE} | MODE=${MODE}"
+echo
+
+# ---- Buat network pterodactyl0 dengan bridge name yang tepat (anti-overlap) ----
+echo "🌐 Membuat network 'pterodactyl0' (anti-overlap)…"
+docker network rm pterodactyl0 >/dev/null 2>&1 || true
+
+created=false
+for SUB in "${CANDIDATE_SUBNETS[@]}"; do
+  GW="$(echo "${SUB}" | sed 's#.0/.*#.1#')"
+  if docker network create \
+      --driver bridge \
+      --subnet "${SUB}" \
+      --gateway "${GW}" \
+      -o com.docker.network.bridge.name=pterodactyl0 \
+      pterodactyl0 >/dev/null 2>&1; then
+    echo "  ✓ OK: ${SUB} (bridge=pterodactyl0)"
+    created=true
+    break
+  else
+    echo "  ✗ Subnet ${SUB} overlap, mencoba yang lain…"
+  fi
+done
+if [[ "${created}" != true ]]; then
+  echo "❌ Gagal membuat network pterodactyl0 tanpa overlap. Edit daftar CANDIDATE_SUBNETS di skrip ini." >&2
+  exit 1
+fi
+echo
+
+# ---- Struktur direktori ----
+mkdir -p /opt/pterodactyl/wings/config
+cd /opt/pterodactyl/wings
+
+# ---- Tulis docker-compose.yml (publik 8080, 2022, 443) ----
+cat > docker-compose.yml <<'YML'
+services:
+  wings:
+    image: __WINGS_IMAGE__
+    container_name: wings
+    restart: always
+    ports:
+      - "8080:8080"   # API/HTTP
+      - "2022:2022"   # SFTP
+      - "443:443"     # HTTPS (wajib dimapping di host)
+    tty: true
+    environment:
+      TZ: "__TZ__"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/containers/:/var/lib/docker/containers/
+      - ./config:/etc/pterodactyl/
+      - /var/lib/pterodactyl/:/var/lib/pterodactyl/
+      - /var/log/pterodactyl/:/var/log/pterodactyl/
+      - /tmp/pterodactyl/:/tmp/pterodactyl/
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+YML
+sed -i "s#__WINGS_IMAGE__#${WINGS_IMAGE}#g" docker-compose.yml
+sed -i "s#__TZ__#${TZ}#g" docker-compose.yml
+
+CONF="config/config.yml"
+mkdir -p config
+
+# ---- Konfigurasi: AUTO atau MANUAL ----
+if [[ "${MODE}" == "auto" && -n "${PANEL_URL}" && -n "${TOKEN}" ]]; then
+  echo "⚙️  Mode AUTO: menulis config.yml via Auto-Deploy token…"
+  $DC up -d   # pastikan image & container siap
+  # tulis config.yml ke /etc/pterodactyl/ (mapped ke ./config)
+  $DC run --rm wings wings configure \
+    --panel-url "${PANEL_URL}" \
+    --token "${TOKEN}"
+else
+  MODE="manual"
+  echo "📄 Mode MANUAL: paste **SELURUH** YAML Node dari Panel → Admin → Nodes → Configuration → Show/Generate."
+  echo "   Path file: $(pwd)/${CONF}"
+  echo "   (Tempel YAML di bawah ini, lalu tekan Ctrl+D untuk simpan)"
+  cat > "${CONF}"
+fi
+
+# ---- Pastikan config.yml tidak kosong ----
+if [[ ! -s "${CONF}" ]]; then
+  echo "❌ ${CONF} kosong. Pastikan sudah menempelkan YAML konfigurasi Node dari Panel." >&2
+  exit 1
+fi
+
+# ---- (Opsional) Sisipkan pengaturan network agar pakai pterodactyl0 ----
+if ! grep -q '^docker:' "${CONF}"; then
+  cat >> "${CONF}" <<'EOF'
+
+docker:
+  network:
+    name: pterodactyl0
+    interface: pterodactyl0
+EOF
+else
+  if ! grep -q 'network:' "${CONF}"; then
+    # tambahkan block network di bawah 'docker:'
+    awk '
+      /^docker:/{print; print "  network:\n    name: pterodactyl0\n    interface: pterodactyl0"; next}
+      {print}
+    ' "${CONF}" > "${CONF}.tmp" && mv "${CONF}.tmp" "${CONF}"
+  fi
+fi
+
+# ---- Start Wings ----
+echo "🚀 Menjalankan Wings…"
+$DC up -d
+sleep 2
+$DC ps
+
+echo
+echo "✅ Selesai. Port yang dibuka: 8080, 2022, **443**"
+echo "   • Cek log:     cd /opt/pterodactyl/wings && $DC logs -f wings"
+echo "   • Jika HTTPS langsung di Wings: pastikan di config.yml bagian api.ssl.enabled: true dan cert/key menunjuk sertifikat valid di server."
+echo "   • Jika di belakang proxy/CF Tunnel: biarkan Wings listen HTTP (8080), tapi 443 tetap terbuka di host untuk kebutuhan proxy."
