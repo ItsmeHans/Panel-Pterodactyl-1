@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# no-root-ptero.sh — Install Pterodactyl Panel + Wings dari $HOME tanpa root.
+set -euo pipefail
+
+### ====== KONFIG (bisa di-override via ENV) ==================================
+: "${APP_URL:=http://localhost}"         # URL Panel (WAJIB benar)
+: "${TZ:=Asia/Jakarta}"
+
+# Port tinggi (aman utk non-root / rootless)
+: "${PANEL_PORT:=8081}"
+: "${WINGS_HTTP_PORT:=8080}"
+: "${WINGS_SFTP_PORT:=22022}"
+
+# Map 443 utk Wings? (hanya jika Docker daemon bukan rootless)
+: "${MAP_WINGS_443:=false}"
+
+# Image
+: "${PANEL_IMAGE:=ghcr.io/pterodactyl/panel:latest}"
+: "${WINGS_IMAGE:=ghcr.io/pterodactyl/wings:latest}"
+
+# Subnet kandidat utk network pterodactyl0
+CANDIDATE_SUBNETS=("10.15.0.0/16" "10.200.0.0/16" "172.31.0.0/16" "10.77.0.0/16")
+### ===========================================================================
+
+# ---- Cek docker/compose ----
+if ! command -v docker >/dev/null 2>&1; then
+  echo "❌ Docker tidak ditemukan. Tanpa root, kamu tidak bisa memasang Docker." >&2
+  exit 1
+fi
+if docker compose version >/dev/null 2>&1; then
+  DC="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+  DC="docker-compose"
+else
+  echo "❌ Docker Compose tidak tersedia. Tanpa root, pemasangan compose sulit dilakukan." >&2
+  exit 1
+fi
+
+# Deteksi rootless
+ROOTLESS=false
+if docker info 2>/dev/null | grep -qi "rootless"; then
+  ROOTLESS=true
+fi
+
+# Jika rootless tapi diminta map 443, nonaktifkan
+if [[ "$ROOTLESS" == true && "$MAP_WINGS_443" == true ]]; then
+  echo "⚠️  Rootless Docker terdeteksi: mapping port 443 tidak didukung. Menonaktifkan MAP_WINGS_443."
+  MAP_WINGS_443=false
+fi
+
+# ---- Helper password random (untuk DB) ----
+rand() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20
+  else
+    tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20
+  fi
+}
+DB_USER_PASS="${DB_USER_PASS:-$(rand)}"
+DB_ROOT_PASS="${DB_ROOT_PASS:-$(rand)}"
+
+echo "🔧 Konfigurasi:"
+echo "  APP_URL         : $APP_URL"
+echo "  TZ              : $TZ"
+echo "  PANEL_PORT      : $PANEL_PORT"
+echo "  WINGS_HTTP_PORT : $WINGS_HTTP_PORT"
+echo "  WINGS_SFTP_PORT : $WINGS_SFTP_PORT"
+echo "  MAP_WINGS_443   : $MAP_WINGS_443 (abaikan jika rootless)"
+echo
+
+BASE="$HOME/pterodactyl-nonroot"
+mkdir -p "$BASE"
+cd "$BASE"
+
+### ====== PANEL (di $HOME) ====================================================
+echo "📦 Menginstal Panel (user-space, port tinggi)…"
+mkdir -p panel
+cd panel
+
+cat > docker-compose.yml <<YML
+services:
+  database:
+    image: mariadb:10.11
+    restart: always
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_DATABASE: panel
+      MYSQL_USER: pterodactyl
+      MYSQL_PASSWORD: ${DB_USER_PASS}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASS}
+      TZ: ${TZ}
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${DB_ROOT_PASS}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  panel:
+    image: ${PANEL_IMAGE}
+    restart: always
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${PANEL_PORT}:80"
+    environment:
+      TZ: ${TZ}
+      APP_ENV: production
+      APP_ENVIRONMENT_ONLY: false
+      APP_URL: ${APP_URL}
+      APP_TIMEZONE: ${TZ}
+      TRUSTED_PROXIES: "*"
+
+      DB_HOST: database
+      DB_PORT: 3306
+      DB_DATABASE: panel
+      DB_USERNAME: pterodactyl
+      DB_PASSWORD: ${DB_USER_PASS}
+
+      CACHE_DRIVER: redis
+      QUEUE_CONNECTION: redis
+      SESSION_DRIVER: redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      MAIL_MAILER: log
+      MAIL_FROM: "noreply@example.com"
+    volumes:
+      - ./data/var:/app/var
+      - ./data/logs:/app/storage/logs
+YML
+
+$DC up -d
+
+echo "⏳ Init Panel (key & migrate)…"
+$DC exec panel php artisan key:generate --force
+$DC exec panel php artisan migrate --force || true
+
+echo "👤 Buat admin Panel (interaktif)…"
+$DC exec panel php artisan p:user:make || true
+
+echo "✅ Panel up. Akses lewat: http://localhost:${PANEL_PORT} (atau via tunnel/proxy ke ${APP_URL})"
+echo "   DB user pass : ${DB_USER_PASS}"
+echo "   DB root pass : ${DB_ROOT_PASS}"
+echo
+
+### ====== WINGS: siapkan network pterodactyl0 (anti-overlap, user-space) =====
+echo "🌐 Menyiapkan network 'pterodactyl0' (anti-overlap)…"
+docker network rm pterodactyl0 >/dev/null 2>&1 || true
+created=false
+for SUB in "${CANDIDATE_SUBNETS[@]}"; do
+  GW="$(echo "${SUB}" | sed 's#.0/.*#.1#')"
+  if docker network create \
+      --driver bridge \
+      --subnet "${SUB}" \
+      --gateway "${GW}" \
+      -o com.docker.network.bridge.name=pterodactyl0 \
+      pterodactyl0 >/dev/null 2>&1; then
+    echo "  ✓ OK: ${SUB} (bridge=pterodactyl0)"
+    created=true
+    break
+  else
+    echo "  ✗ Subnet ${SUB} overlap, mencoba yang lain…"
+  fi
+done
+if [[ "${created}" != true ]]; then
+  echo "❌ Gagal membuat network pterodactyl0 tanpa overlap. Edit CANDIDATE_SUBNETS di skrip ini." >&2
+  exit 1
+fi
+echo
+
+### ====== WINGS (di $HOME) ====================================================
+echo "🪽 Menginstal Wings (user-space)…"
+cd "$BASE"
+mkdir -p wings/config
+cd wings
+
+# siapkan mapping port (443 opsional)
+EXTRA443=""
+if [[ "$MAP_WINGS_443" == true ]]; then
+  EXTRA443='      - "443:443"'
+fi
+
+cat > docker-compose.yml <<YML
+services:
+  wings:
+    image: ${WINGS_IMAGE}
+    container_name: wings
+    restart: always
+    ports:
+      - "${WINGS_HTTP_PORT}:8080"
+      - "${WINGS_SFTP_PORT}:2022"
+$(printf "%s\n" "$EXTRA443")
+    tty: true
+    environment:
+      TZ: "${TZ}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/containers/:/var/lib/docker/containers/
+      - ./config:/etc/pterodactyl/
+      - ./data/pterodata:/var/lib/pterodactyl/
+      - ./data/logs:/var/log/pterodactyl/
+      - ./data/tmp:/tmp/pterodactyl/
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+YML
+
+CONF="config/config.yml"
+mkdir -p config
+
+echo "📄 Isi config Wings:"
+echo "   Buka Panel → Admin → Nodes → (pilih node) → Configuration → Show/Generate"
+echo "   SALIN **SELURUH YAML** ke file berikut (paste lalu tekan Ctrl+D):"
+echo "   $(pwd)/$CONF"
+cat > "$CONF"
+
+# Tambahkan pengaturan network agar pakai pterodactyl0
+if ! grep -q '^docker:' "$CONF"; then
+  cat >> "$CONF" <<'EOF'
+
+docker:
+  network:
+    name: pterodactyl0
+    interface: pterodactyl0
+EOF
+else
+  if ! grep -q 'network:' "$CONF"; then
+    awk '
+      /^docker:/{print; print "  network:\n    name: pterodactyl0\n    interface: pterodactyl0"; next}
+      {print}
+    ' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+  fi
+fi
+
+echo "🚀 Menjalankan Wings…"
+$DC up -d
+sleep 2
+$DC ps
+
+echo
+echo "✅ Selesai."
+echo "   • Panel: http://localhost:${PANEL_PORT}  (sesuaikan APP_URL di .env Panel)"
+echo "   • Wings HTTP : http://localhost:${WINGS_HTTP_PORT}"
+echo "   • Wings SFTP : ${WINGS_SFTP_PORT}"
+if [[ "$MAP_WINGS_443" == true ]]; then
+  echo "   • Wings HTTPS: 443 (aktif — pastikan config.yml api.ssl.enabled=true + cert/key valid)"
+else
+  echo "   • Jika perlu akses HTTPS publik tanpa root/443 lokal, gunakan Cloudflare Tunnel/Reverse proxy ke ${WINGS_HTTP_PORT} & ${PANEL_PORT}."
+fi
