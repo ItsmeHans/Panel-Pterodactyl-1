@@ -134,7 +134,7 @@ echo
 ### === WINGS =================================================================
 echo "🪽 Installing Pterodactyl Wings…"
 cd ..
-mkdir -p wings
+mkdir -p wings/config
 cd wings
 
 # compose untuk wings
@@ -187,16 +187,17 @@ else
   sed -i 's#__WINGS_443__##' docker-compose.yml
 fi
 
-CONF="config.yml"
+CONF="config/config.yml"
 if [[ ! -s "$CONF" ]]; then
   echo "ℹ️  Belum ada $CONF."
   echo "    Buka Panel → Admin → Nodes → (pilih node) → Configuration → Show/Generate"
   echo "    SALIN **SELURUH YAML** ke: $(pwd)/$CONF"
   if command -v nano >/dev/null 2>&1; then
     echo "✏️  Membuka nano… (paste YAML, Ctrl+O Enter, Ctrl+X)"
+    mkdir -p config && touch "$CONF"
     nano "$CONF"
   else
-    echo "   (Tidak ada nano) Jalankan:  nano config.yml  atau vi/echo > file"
+    echo "   (Tidak ada nano) Jalankan:  mkdir -p config && nano config/config.yml  atau vi/echo > file"
   fi
 fi
 
